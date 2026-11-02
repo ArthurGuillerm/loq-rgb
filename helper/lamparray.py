@@ -39,6 +39,8 @@ USAGES = {
 KIND_KEYBOARD = 1
 MAX_ZONES = 32            # per-key keyboards are grouped into at most this many columns
 WATCHDOG_S = 5.0
+REFRESH_TICKS = 3          # every 3rd watchdog tick (15 s): quietly take the keyboard back if the firmware did
+REASSERT_AFTER_S = 1.0     # a new command re-asserts control unless control was asserted less than this ago
 HEX = "0123456789abcdef"
 IN_CLOSE_WRITE, IN_MOVED_TO = 0x8, 0x80
 
@@ -357,6 +359,8 @@ class Helper:
         self.session = self.engine = self.bins = None
         self.info = {}
         self.has_control = False
+        self.control_at = 0.0
+        self.ticks = 0
         self.last_sent = {}
         self.desired = None
         self.last_seq = None
@@ -473,8 +477,18 @@ class Helper:
 
     # ---- commands
     def take_control(self):
+        """Ask for host control and forget what we believe the lamps show: the next frame is a full refresh."""
         self.session.set_autonomous(False)
         self.has_control, self.last_sent = True, {}
+        self.control_at = time.monotonic()
+
+    def refresh(self):
+        """Insurance against a silent take-over (Fn+Space, suspend, firmware timeout): take the keyboard back."""
+        try:
+            self.take_control()
+            self.push_frame()
+        except OSError as e:
+            self.drop_session(e.strerror or str(e))
 
     def release_control(self):
         if self.session and self.has_control:
@@ -491,6 +505,8 @@ class Helper:
             snap = not self.has_control
             if snap:
                 self.take_control()
+            elif now - self.control_at > REASSERT_AFTER_S:
+                self.take_control()                    # the firmware may have taken the keyboard back since
             if cmd["mode"] == "off":
                 goal = [(0, 0, 0)] * len(self.bins)
             else:
@@ -553,6 +569,10 @@ class Helper:
         if jump > 2.0 and self.session and self.desired:   # resumed from suspend: firmware may have taken over
             self.has_control, self.last_sent = False, {}
             self.apply(self.desired, now)
+        self.ticks += 1
+        if (self.ticks % REFRESH_TICKS == 0 and self.session and self.has_control
+                and self.desired and self.desired["mode"] != "auto"):
+            self.refresh()                             # never in Auto mode: that one is the firmware's on purpose
         self.emit("BEAT")
 
     def not_owner(self):
